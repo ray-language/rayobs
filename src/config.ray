@@ -1,0 +1,119 @@
+//! `rayobs.toml`: where to listen and keep the data, for how long, and what to scrape.
+//!
+//! ```toml
+//! [server]
+//! listen = "127.0.0.1:9400"
+//! data = "data"
+//! retention = "7d"            # whole hours older than this are deleted
+//! commit_ms = 0               # extra wait to gather a commit (0: what queued during the last fsync)
+//! token = ""                  # bearer token for every request ("" = open)
+//!
+//! [[scrape]]
+//! job = "raystat"
+//! url = "http://127.0.0.1:9102/metrics"
+//! interval = "15s"
+//! ```
+
+import std/fs;
+import std/toml;
+
+pub struct Target {
+    job: string,
+    url: string,
+    interval_ms: int,
+}
+
+pub struct Config {
+    host: string,
+    port: int,
+    data: string,
+    retention_ms: int,
+    commit_ms: int,
+    token: string,
+    targets: [Target],
+}
+
+pub fn defaults() -> Config {
+    Config {
+        host: "127.0.0.1",
+        port: 9400,
+        data: "data",
+        retention_ms: 7 * 86400000,
+        commit_ms: 0,
+        token: "",
+        targets: []
+    }
+}
+
+/// `"500ms"`, `"15s"`, `"10m"`, `"6h"`, `"7d"` → milliseconds.
+pub fn duration_ms(s: string) -> Option<int> {
+    let (digits, unit) = if (s.ends_with("ms")) {
+        (s.substring(0, s.len() - 2), 1)
+    } else if (s.ends_with("s")) {
+        (s.substring(0, s.len() - 1), 1000)
+    } else if (s.ends_with("m")) {
+        (s.substring(0, s.len() - 1), 60000)
+    } else if (s.ends_with("h")) {
+        (s.substring(0, s.len() - 1), 3600000)
+    } else if (s.ends_with("d")) {
+        (s.substring(0, s.len() - 1), 86400000)
+    } else {
+        return Option.None;
+    };
+    let n = parse_int(digits)?;
+    if (n < 0 || n > 3650 * 86400) { Option.None } else { Option.Some(n * unit) }
+}
+
+pub fn load(path: string) -> Result<Config, string> {
+    parse(fs.read_file(path)?)
+}
+
+fn str_of(e: [toml.TomlEntry], key: string, default: string) -> Result<string, string> {
+    match (toml.toml_get(e, key)) {
+        Option.Some(toml.TomlValue.TStr(s)) => Result.Ok(s),
+        Option.Some(_) => Result.Err("${key} must be a string"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+fn dur_of(e: [toml.TomlEntry], key: string, default: string) -> Result<int, string> {
+    let s = str_of(e, key, default)?;
+    duration_ms(s).ok_or("${key}: '${s}' is not a duration like 15s, 10m, 7d")
+}
+
+pub fn parse(src: string) -> Result<Config, string> {
+    let e = toml.parse_toml(src)?;
+    var c = defaults();
+    let listen = str_of(e, "server.listen", "${c.host}:${c.port}")?;
+    match (listen.last_index_of(":")) {
+        Option.Some(i) => {
+            c.host = listen.substring(0, i);
+            c.port = parse_int(listen.substring(i + 1, listen.len())).ok_or(
+                "server.listen: bad port"
+            )?;
+        },
+        Option.None => return Result.Err("server.listen must be HOST:PORT"),
+    }
+    c.data = str_of(e, "server.data", c.data)?;
+    c.retention_ms = dur_of(e, "server.retention", "7d")?;
+    c.commit_ms = match (toml.toml_get(e, "server.commit_ms")) {
+        Option.Some(toml.TomlValue.TInt(n)) => n,
+        Option.Some(_) => return Result.Err("server.commit_ms must be an integer"),
+        Option.None => c.commit_ms,
+    };
+    c.token = str_of(e, "server.token", "")?;
+    for i in 0..toml.toml_array_len(e, "scrape") {
+        let p = "scrape.${i}";
+        let job = str_of(e, "${p}.job", "")?;
+        let url = str_of(e, "${p}.url", "")?;
+        if (job == "" || !(url.starts_with("http://") || url.starts_with("https://"))) {
+            return Result.Err("[[scrape]] ${i + 1} needs a job and an http(s) url");
+        }
+        let interval = dur_of(e, "${p}.interval", "15s")?;
+        if (interval < 1000) {
+            return Result.Err("[[scrape]] ${job}: interval of at least 1s");
+        }
+        c.targets.push(Target { job: job, url: url, interval_ms: interval });
+    }
+    Result.Ok(c)
+}

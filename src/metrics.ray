@@ -1,0 +1,169 @@
+//! Range queries over stored samples: one series per label set, a point per step.
+//!
+//! | fn | point of a step |
+//! |---|---|
+//! | `last` | the last sample in the step |
+//! | `avg`, `min`, `max` | over the samples in the step |
+//! | `rate` | per-second increase of a counter over the step (resets count as a restart from 0) |
+//!
+//! With `sum`, the series are added point by point into one.
+
+import prom;
+import store;
+
+pub struct Series {
+    labels: string,
+    points: [(int, float)],
+}
+
+pub struct Query {
+    name: string,
+    matchers: [(string, string)],
+    from: int,
+    to: int,
+    step: int,
+    func: string,
+    sum: bool,
+}
+
+pub const FUNCS: [string] = ["last", "avg", "min", "max", "rate"];
+
+const MAX_POINTS: int = 11000;
+
+/// `name{k="v",…}` → (name, matchers).
+pub fn parse_selector(s: string) -> Option<(string, [(string, string)])> {
+    match (s.index_of("{")) {
+        Option.Some(b) => {
+            if (!s.ends_with("}")) {
+                return Option.None;
+            }
+            Option.Some((s.substring(0, b), prom.parse_labels(s.substring(b + 1, s.len() - 1))?))
+        },
+        Option.None => Option.Some((s, [])),
+    }
+}
+
+pub fn run(data: string, q: Query) -> Result<[Series], string> {
+    if (q.step <= 0 || q.to <= q.from) {
+        return Result.Err("need from < to and a positive step");
+    }
+    if ((q.to - q.from) / q.step > MAX_POINTS) {
+        return Result.Err("too many points: widen the step");
+    }
+    if (!FUNCS.contains(q.func)) {
+        return Result.Err("fn must be one of ${join(FUNCS, ", ")}");
+    }
+    // One step before `from` too, so the first rate has a previous sample.
+    let recs = store.scan(
+        data,
+        "metrics",
+        q.from - q.step,
+        q.to,
+        store.Filter { a: q.name, b: "", text: "" },
+        5000000
+    );
+    let by: Map<string, [(int, float)]> = Map.new();
+    for r in recs {
+        if (prom.matches(r.b, q.matchers)) {
+            let xs = by.get_or(r.b, []);
+            xs.push((r.ts, parse_float(r.body).unwrap_or(0.0)));
+            by.insert(r.b, xs);
+        }
+    }
+    var out: [Series] = [];
+    for labels in sort(by.keys()) {
+        out.push(Series { labels: labels, points: points(by.get(labels).unwrap(), q) });
+    }
+    if (q.sum && out.len() > 0) {
+        return Result.Ok([Series { labels: "", points: summed(out) }]);
+    }
+    Result.Ok(out)
+}
+
+// The point of each step [t - step, t), for t = from + step, from + 2·step, … ≤ to.
+fn points(samples: [(int, float)], q: Query) -> [(int, float)] {
+    var out: [(int, float)] = [];
+    var i = 0;
+    var prev_ts = -1;
+    var prev_v = 0.0;
+    var t = q.from + q.step;
+    while (t <= q.to) {
+        var n = 0;
+        var acc = 0.0;
+        var lo = 0.0;
+        var hi = 0.0;
+        var last = 0.0;
+        var increase = 0.0;
+        var first_ts = -1;
+        var last_ts = -1;
+        while (i < samples.len()) {
+            let (ts, v) = samples[i];
+            if (ts >= t) {
+                break;
+            }
+            if (ts >= t - q.step) {
+                if (n == 0) {
+                    lo = v;
+                    hi = v;
+                    first_ts = if (prev_ts >= 0 && prev_ts >= t - 2 * q.step) {
+                        prev_ts
+                    } else {
+                        ts
+                    };
+                    if (prev_ts >= 0 && prev_ts >= t - 2 * q.step) {
+                        increase = increase + delta(prev_v, v);
+                    }
+                } else {
+                    increase = increase + delta(last, v);
+                }
+                n = n + 1;
+                acc = acc + v;
+                if (v < lo) {
+                    lo = v;
+                }
+                if (v > hi) {
+                    hi = v;
+                }
+                last = v;
+                last_ts = ts;
+            }
+            prev_ts = ts;
+            prev_v = v;
+            i = i + 1;
+        }
+        if (n > 0) {
+            let value = match (q.func) {
+                "last" => Option.Some(last),
+                "avg" => Option.Some(acc / (n as float)),
+                "min" => Option.Some(lo),
+                "max" => Option.Some(hi),
+                _ => if (last_ts > first_ts) {
+                    Option.Some(increase * 1000.0 / ((last_ts - first_ts) as float))
+                } else {
+                    Option.None
+                },
+            };
+            match (value) {
+                Option.Some(x) => out.push((t, x)),
+                Option.None => { },
+            }
+        }
+        t = t + q.step;
+    }
+    out
+}
+
+// A counter's increase between two samples; a drop is a restart from zero.
+fn delta(before: float, after: float) -> float {
+    if (after >= before) { after - before } else { after }
+}
+
+fn summed(xs: [Series]) -> [(int, float)] {
+    let by: Map<int, float> = Map.new();
+    for s in xs {
+        for (t, v) in s.points {
+            by.insert(t, by.get_or(t, 0.0) + v);
+        }
+    }
+    sort(by.keys()).map(fn(t: int) -> (int, float) { (t, by.get(t).unwrap()) })
+}

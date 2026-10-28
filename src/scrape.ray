@@ -1,0 +1,80 @@
+//! Scraping: one fiber per target fetches its `/metrics` every interval and stores the samples
+//! with `job` and `instance` labels, plus `up` (1 or 0), `scrape_duration_seconds` and
+//! `scrape_samples` for the target itself, as Prometheus does.
+
+import std/time;
+import std/url;
+import net/http;
+import config;
+import prom;
+import store;
+
+fn instance_of(u: string) -> string {
+    match (url.parse(u)) {
+        Result.Ok(p) => {
+            let host = p.host.unwrap_or("");
+            match (p.port) {
+                Option.Some(port) => "${host}:${port}",
+                Option.None => host,
+            }
+        },
+        Result.Err(_) => u,
+    }
+}
+
+/// One scrape: the records to store (always at least `up`).
+pub fn once(t: config.Target, now: int) -> [store.Rec] {
+    let base = [("job", t.job), ("instance", instance_of(t.url))];
+    let own = prom.canonical(base);
+    let timeout = if (t.interval_ms < 10000) { t.interval_ms } else { 10000 };
+    let t0 = time.monotonic_nanos();
+    let page = match (http.request_pairs("GET", t.url, bytes_of([]), [("Accept", "text/plain")], timeout)) {
+        Result.Ok(r) => if (r.status == 200) {
+            from_utf8(r.body).ok()
+        } else {
+            Option.None
+        },
+        Result.Err(_) => Option.None,
+    };
+    let secs = ((time.monotonic_nanos() - t0) as float) / 1000000000.0;
+    var out: [store.Rec] = [];
+    var up = 0.0;
+    var n = 0;
+    match (page) {
+        Option.Some(text) => {
+            up = 1.0;
+            let (samples, _) = prom.parse(text);
+            for s in samples {
+                out.push(
+                    store.Rec {
+                        ts: now,
+                        a: s.name,
+                        b: prom.with_labels(s.labels, base),
+                        body: to_string(s.value)
+                    }
+                );
+            }
+            n = samples.len();
+        },
+        Option.None => { },
+    }
+    out.push(store.Rec { ts: now, a: "up", b: own, body: to_string(up) });
+    out.push(store.Rec { ts: now, a: "scrape_duration_seconds", b: own, body: to_string(secs) });
+    out.push(store.Rec { ts: now, a: "scrape_samples", b: own, body: to_string(n as float) });
+    out
+}
+
+/// Scrapes `t` until `stop` is closed.
+pub fn run(t: config.Target, metrics: Channel<store.Msg>, stop: Channel<int>) {
+    while (true) {
+        let recs = once(t, time.now());
+        match (store.append(metrics, recs)) {
+            Result.Ok(_) => { },
+            Result.Err(e) => eprint("rayobs: scrape ${t.job}: ${e}"),
+        }
+        match (select_timeout([stop], t.interval_ms)) {
+            Option.Some(_) => return,
+            Option.None => { },
+        }
+    }
+}

@@ -1,0 +1,133 @@
+// The exposition parser on a page shaped like raystat's, and range queries on synthetic series
+// with known answers: last/avg/max, a counter's rate across a restart, and sum.
+
+import std/fs;
+import metrics;
+import prom;
+import store;
+
+const PAGE: string = `# HELP api_requests_total Requests.
+# TYPE api_requests_total counter
+api_requests_total{method="get",code="200"} 1027
+api_requests_total{code="500",method="get"} 3 1793232000000
+# TYPE api_latency summary
+api_latency{quantile="0.5"} 12
+api_latency{quantile="0.99"} 87.5
+api_latency_sum 1234.5
+api_latency_count 1030
+odd_label{path="a \\"quoted\\" {brace}"} 1
+le_inf{le="+Inf"} +Inf
+nan_value NaN
+broken{oops 1
+`;
+
+@test
+fn parses_an_exposition_page() {
+    let (samples, bad) = prom.parse(PAGE);
+    assert_eq(bad, 2);
+    assert_eq(samples.len(), 8);
+    assert_eq(samples[0].labels, `code="200",method="get"`);
+    // The same series whatever the label order.
+    assert_eq(samples[1].labels, `code="500",method="get"`);
+    assert_eq(samples[2].labels, `quantile="0.5"`);
+    assert_eq(
+        (samples[4].name, samples[4].labels, samples[4].value),
+        ("api_latency_sum", "", 1234.5)
+    );
+    assert_eq(samples[6].labels, `path="a \\"quoted\\" {brace}"`);
+    assert(samples[7].value > 1e308);
+    assert_eq(
+        prom.with_labels(`code="200"`, [("job", "api"), ("code", "x")]),
+        `code="200",job="api"`
+    );
+    assert(prom.matches(`code="200",job="api"`, [("job", "api")]));
+    assert(!prom.matches(`code="200",job="api"`, [("job", "web")]));
+    assert_eq(metrics.parse_selector(`up{job="api"}`), Option.Some(("up", [("job", "api")])));
+}
+
+fn sample(ts: int, labels: string, v: float) -> store.Rec {
+    store.Rec { ts: ts, a: "reqs", b: labels, body: to_string(v) }
+}
+
+fn q(func: string, sum: bool, from: int, to: int) -> metrics.Query {
+    metrics.Query {
+        name: "reqs",
+        matchers: [],
+        from: from,
+        to: to,
+        step: 10000,
+        func: func,
+        sum: sum
+    }
+}
+
+fn values(s: metrics.Series) -> [float] {
+    s.points.map(fn(p: (int, float)) -> float {
+        let (_, v) = p;
+        v
+    })
+}
+
+@test
+fn range_queries() {
+    let data = fs.make_temp_dir("rayobs-m").unwrap();
+    let s = store.start(data, "metrics", 5, 0).unwrap();
+    let t0 = 1793232000000;
+    // A counter scraped every 5 s: +10 per scrape, a restart at 50 s, then +10 again.
+    var recs: [store.Rec] = [];
+    let a = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 0.0, 10.0, 20.0, 30.0];
+    for i in 0..a.len() {
+        recs.push(sample(t0 + i * 5000, `job="a"`, a[i]));
+        recs.push(sample(t0 + i * 5000, `job="b"`, 1.0));
+    }
+    store.append(s, recs).unwrap();
+    store.stop(s);
+    let from = t0;
+    let to = t0 + 70000;
+    let last = metrics.run(data, q("last", false, from, to)).unwrap();
+    assert_eq(last.len(), 2);
+    assert_eq(values(last[0]), [10.0, 30.0, 50.0, 70.0, 90.0, 10.0, 30.0]);
+    let avg = metrics.run(data, q("avg", false, from, to)).unwrap();
+    assert_eq(values(avg[0]), [5.0, 25.0, 45.0, 65.0, 85.0, 5.0, 25.0]);
+    // 10 per 5 s = 2/s, also across the restart (90 → 0 counts 0, then +10).
+    let rate = metrics.run(data, q("rate", false, from, to)).unwrap();
+    let r = values(rate[0]);
+    assert_eq(r[0], 2.0);
+    assert_eq(r[3], 2.0);
+    assert(r[5] > 0.0 && r[5] <= 2.0);
+    let sum = metrics.run(data, metrics.Query {
+        name: "reqs",
+        matchers: [],
+        from: from,
+        to: to,
+        step: 10000,
+        func: "last",
+        sum: true
+    })
+        .unwrap();
+    assert_eq(sum.len(), 1);
+    assert_eq(values(sum[0])[0], 11.0);
+    let only_b = metrics.run(data, metrics.Query {
+        name: "reqs",
+        matchers: [("job", "b")],
+        from: from,
+        to: to,
+        step: 10000,
+        func: "max",
+        sum: false
+    })
+        .unwrap();
+    assert_eq((only_b.len(), values(only_b[0])[2]), (1, 1.0));
+    assert(metrics.run(data, q("median", false, from, to)).is_err());
+    assert(metrics.run(data, metrics.Query {
+        name: "reqs",
+        matchers: [],
+        from: from,
+        to: from + 1000000000,
+        step: 1,
+        func: "last",
+        sum: false
+    })
+        .is_err());
+    fs.remove_all(data);
+}

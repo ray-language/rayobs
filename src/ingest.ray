@@ -1,0 +1,146 @@
+//! Turning what producers send into records: log lines (the JSON of `net/log`, or any text),
+//! spans, and pushed exposition pages.
+
+import std/json;
+import std/time;
+import prom;
+import store;
+
+fn str(s: string) -> json.Json {
+    json.Json.JStr(s)
+}
+
+/// A `ts` given as epoch ms or as RFC 3339 text; `now` when absent or unreadable.
+fn ts_of(j: json.Json, now: int) -> int {
+    match (json.member(j, "ts")) {
+        Option.Some(json.Json.JNum(f)) => f as int,
+        Option.Some(json.Json.JStr(s)) => time.parse_iso8601_millis(s).unwrap_or(now),
+        _ => now,
+    }
+}
+
+/// One log line. A JSON object keeps its fields (`service`, `trace_id`, `level`, `msg`…) and is
+/// stored with its keys sorted and the level lowercased, so `"level":"error"` always reads the
+/// same; anything else
+/// becomes `{"msg": line}`. `service` fills in a missing service.
+pub fn log_line(line: string, service: string, now: int) -> Option<store.Rec> {
+    let t = line.trim();
+    if (t == "") {
+        return Option.None;
+    }
+    let obj = match (json.parse(t)) {
+        Result.Ok(json.Json.JObject(m)) => m,
+        _ => {
+            let m: Map<string, json.Json> = Map.new();
+            m.insert("msg", str(t));
+            m
+        },
+    };
+    let j = json.Json.JObject(obj);
+    let ts = ts_of(j, now);
+    let svc = json.get_string(j, "service").unwrap_or(service);
+    if (!obj.contains_key("service")) {
+        obj.insert("service", str(svc));
+    }
+    // net/log writes INFO/ERROR; stored lowercase, so a level filter is one exact substring.
+    obj.insert("level", str(json.get_string(j, "level").unwrap_or("info").to_lower()));
+    obj.remove("ts");
+    Option.Some(
+        store.Rec {
+            ts: ts,
+            a: svc,
+            b: json.get_string(j, "trace_id").unwrap_or(""),
+            body: json.stringify(json.Json.JObject(obj))
+        }
+    )
+}
+
+pub fn logs(body: string, service: string, now: int) -> [store.Rec] {
+    var out: [store.Rec] = [];
+    for line in body.split("\n") {
+        match (log_line(line, service, now)) {
+            Option.Some(r) => out.push(r),
+            Option.None => { },
+        }
+    }
+    out
+}
+
+fn hex_of_len(s: string, n: int) -> bool {
+    if (s.len() != n) {
+        return false;
+    }
+    for c in s.chars() {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One span: `trace_id` (32 hex), `span_id` (16 hex), `parent_id` (16 hex or absent),
+/// `service`, `name`, `start_ms`, `duration_ms`, and optional `status` and `attrs`.
+pub fn span(j: json.Json) -> Result<store.Rec, string> {
+    let trace = json.get_string(j, "trace_id").unwrap_or("");
+    let id = json.get_string(j, "span_id").unwrap_or("");
+    let parent = json.get_string(j, "parent_id").unwrap_or("");
+    if (!hex_of_len(trace, 32)
+        || !hex_of_len(id, 16)
+        || (parent != "" && !hex_of_len(parent, 16))) {
+        return Result.Err("trace_id must be 32 lowercase hex, span_id and parent_id 16");
+    }
+    let start = json.get_int(j, "start_ms").ok_or("start_ms is required")?;
+    let service = json.get_string(j, "service").ok_or("service is required")?;
+    let name = json.get_string(j, "name").ok_or("name is required")?;
+    let m: Map<string, json.Json> = Map.new();
+    m.insert("trace_id", str(trace));
+    m.insert("span_id", str(id));
+    m.insert("parent_id", str(parent));
+    m.insert("service", str(service));
+    m.insert("name", str(name));
+    m.insert("start_ms", json.Json.JNum(start as float));
+    m.insert("duration_ms", json.Json.JNum(json.get_float(j, "duration_ms").unwrap_or(0.0)));
+    m.insert("status", str(json.get_string(j, "status").unwrap_or("ok")));
+    m.insert("attrs", json.member(j, "attrs").unwrap_or(json.Json.JObject(Map.new())));
+    Result.Ok(
+        store.Rec { ts: start, a: service, b: trace, body: json.stringify(json.Json.JObject(m)) }
+    )
+}
+
+/// A JSON array of spans, or one span object per line.
+pub fn spans(body: string) -> Result<[store.Rec], string> {
+    var items: [json.Json] = [];
+    match (json.parse(body)) {
+        Result.Ok(json.Json.JArray(xs)) => items = xs,
+        Result.Ok(j) => items = [j],
+        Result.Err(_) => {
+            for line in body.split("\n") {
+                if (line.trim() != "") {
+                    items.push(
+                        json.parse(line).map_err(fn(e: string) -> string { "bad JSON line: ${e}" })?
+                    );
+                }
+            }
+        },
+    }
+    var out: [store.Rec] = [];
+    for it in items {
+        out.push(span(it)?);
+    }
+    Result.Ok(out)
+}
+
+/// A pushed exposition page, with `job` added to every series.
+pub fn pushed(text: string, job: string, now: int) -> ([store.Rec], int) {
+    let (samples, bad) = prom.parse(text);
+    let extra = if (job == "") { [] } else { [("job", job)] };
+    let recs = samples.map(fn(s: prom.Sample) -> store.Rec {
+        store.Rec {
+            ts: now,
+            a: s.name,
+            b: prom.with_labels(s.labels, extra),
+            body: to_string(s.value)
+        }
+    });
+    (recs, bad)
+}

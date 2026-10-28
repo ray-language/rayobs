@@ -1,0 +1,353 @@
+//! rayobs: where metrics, logs and traces are kept.
+
+import std/json;
+import std/net;
+import std/process;
+import std/time;
+import std/url;
+import net/http;
+import net/webserver;
+import config;
+import server;
+
+const VERSION: string = "0.1.0";
+
+fn usage() -> string {
+    `rayobs ${VERSION} — metrics, logs and traces, kept on disk and queried by time
+
+  rayobs serve [--config rayobs.toml]
+  rayobs ship --service NAME [--api URL] -- COMMAND [ARGS…]
+                  run COMMAND, pass its output through, and send every line as a log
+  rayobs logs [--service S] [--trace ID] [--level L] [--grep TEXT] [--since 1h] [--limit 100]
+  rayobs trace ID [--since 1d]                 the spans as a waterfall, then the logs
+  rayobs query 'name{k="v"}' [--fn rate] [--step 1m] [--since 1h] [--sum]
+  rayobs blast [--api URL] [-n LINES] [-c CLIENTS] [-b LINES_PER_REQUEST]
+                  ingestion load: lines/s through the API
+  --api URL (RAYOBS_API, default http://127.0.0.1:9400), --token T (RAYOBS_TOKEN)
+`
+}
+
+fn flag(argv: [string], name: string, default: string) -> string {
+    for i in 0..argv.len() {
+        if (argv[i] == "--") {
+            break;
+        }
+        if (argv[i] == name && i + 1 < argv.len()) {
+            return argv[i + 1];
+        }
+    }
+    default
+}
+
+fn has(argv: [string], name: string) -> bool {
+    argv.contains(name)
+}
+
+fn env_or(name: string, default: string) -> string {
+    match (env(name)) {
+        Option.Some(v) => if (v == "") { default } else { v },
+        Option.None => default,
+    }
+}
+
+fn api(argv: [string]) -> string {
+    flag(argv, "--api", env_or("RAYOBS_API", "http://127.0.0.1:9400"))
+}
+
+fn headers(argv: [string]) -> [(string, string)] {
+    let t = flag(argv, "--token", env_or("RAYOBS_TOKEN", ""));
+    if (t == "") { [] } else { [("Authorization", "Bearer ${t}")] }
+}
+
+fn get(argv: [string], path: string) -> Result<json.Json, string> {
+    let r = http.request_pairs("GET", api(argv) + path, bytes_of([]), headers(argv), 30000)?;
+    let j = json.parse(from_utf8(r.body).unwrap_or("{}"))?;
+    if (r.status != 200) {
+        return Result.Err("${r.status}: ${json.get_string(j, "error").unwrap_or("?")}");
+    }
+    Result.Ok(j)
+}
+
+fn serve(argv: [string]) -> Result<int, string> {
+    let path = flag(argv, "--config", "rayobs.toml");
+    let cfg = config.load(path).map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+    let l = net.tcp_listen(cfg.host, cfg.port)?;
+    let r = server.start(cfg, l)?;
+    print(
+        "rayobs ${VERSION}: http://${cfg.host}:${r.port}, data in ${cfg.data}, retention ${cfg.retention_ms / 3600000} h, commit window ${cfg.commit_ms} ms, ${cfg.targets.len()} scrape target(s)"
+    );
+    recv(webserver.shutdown_signals());
+    server.stop(r);
+    print("rayobs: stopped");
+    Result.Ok(0)
+}
+
+// --- ship ---
+
+fn post_lines(argv: [string], service: string, lines: [string]) {
+    if (lines.len() == 0) {
+        return;
+    }
+    let body = join(lines, "\n").to_bytes();
+    let url = "${api(argv)}/v1/logs?service=${url.url_encode(service)}";
+    match (http.request_pairs("POST", url, body, headers(argv), 10000)) {
+        Result.Ok(r) => if (r.status != 200) {
+            eprint("rayobs ship: ${r.status} from ${api(argv)}");
+        },
+        Result.Err(e) => eprint("rayobs ship: ${e}"),
+    }
+}
+
+const SHIP_EVERY_MS: int = 200;
+
+const SHIP_MAX_LINES: int = 1000;
+
+fn ship(argv: [string]) -> Result<int, string> {
+    let service = flag(argv, "--service", "");
+    let dash = argv.position("--").ok_or("ship needs -- COMMAND")?;
+    if (service == "" || dash + 1 >= argv.len()) {
+        return Result.Err("ship needs --service NAME and -- COMMAND [ARGS…]");
+    }
+    let p = process.cmd(argv[dash + 1], argv.slice(dash + 2, argv.len())).merge_output().stream()?;
+    // SIGTERM/SIGINT go on to the child: it ends, its output ends, and so does ship.
+    spawn(fn() {
+        recv(webserver.shutdown_signals());
+        p.kill(false);
+    });
+    var carry = "";
+    var batch: [string] = [];
+    var due = time.now() + SHIP_EVERY_MS;
+    while (true) {
+        let wait = due - time.now();
+        match (select_timeout([p.out], if (wait < 1) { 1 } else { wait })) {
+            Option.Some(_) => match (recv(p.out)) {
+                Option.Some(chunk) => {
+                    let text = carry + from_utf8(chunk).unwrap_or("");
+                    let parts = text.split("\n");
+                    carry = parts[parts.len() - 1];
+                    for line in parts.slice(0, parts.len() - 1) {
+                        print(line);
+                        batch.push(line);
+                    }
+                    if (batch.len() >= SHIP_MAX_LINES) {
+                        post_lines(argv, service, batch);
+                        batch = [];
+                        due = time.now() + SHIP_EVERY_MS;
+                    }
+                },
+                Option.None => break,
+            },
+            Option.None => {
+                post_lines(argv, service, batch);
+                batch = [];
+                due = time.now() + SHIP_EVERY_MS;
+            },
+        }
+    }
+    if (carry != "") {
+        print(carry);
+        batch.push(carry);
+    }
+    post_lines(argv, service, batch);
+    match (p.wait()) {
+        process.Exit.Code(n) => Result.Ok(n),
+        process.Exit.Signal(s) => Result.Ok(128 + s),
+    }
+}
+
+// --- reading ---
+
+fn q(pairs: [(string, string)]) -> string {
+    var out: [string] = [];
+    for (k, v) in pairs {
+        if (v != "") {
+            out.push("${k}=${url.url_encode(v)}");
+        }
+    }
+    join(out, "&")
+}
+
+fn logs(argv: [string]) -> Result<int, string> {
+    let qs = q(
+        [
+            ("service", flag(argv, "--service", "")),
+            ("trace_id", flag(argv, "--trace", "")),
+            ("level", flag(argv, "--level", "")),
+            ("q", flag(argv, "--grep", "")),
+            ("since", flag(argv, "--since", "1h")),
+            ("limit", flag(argv, "--limit", "100"))
+        ]
+    );
+    let j = get(argv, "/v1/logs?${qs}")?;
+    for l in json.get_array(j, "logs").unwrap_or([]) {
+        print(log_text(l));
+    }
+    Result.Ok(0)
+}
+
+fn log_text(l: json.Json) -> string {
+    let ts = json.get_string(l, "ts").unwrap_or("");
+    let level = json.get_string(l, "level").unwrap_or("").to_upper();
+    let svc = json.get_string(l, "service").unwrap_or("");
+    let msg = json.get_string(l, "msg").unwrap_or("");
+    "${ts} ${level} ${svc}: ${msg}"
+}
+
+fn trace(argv: [string]) -> Result<int, string> {
+    let id = argv.slice(1, argv.len()).filter(fn(a: string) -> bool { !a.starts_with("--") });
+    if (id.len() == 0) {
+        return Result.Err("trace needs an ID");
+    }
+    let j = get(argv, "/v1/traces/${id[0]}?${q([("since", flag(argv, "--since", "1d"))])}")?;
+    let spans = json.get_array(j, "spans").unwrap_or([]);
+    var t0 = 0;
+    var t1 = 0;
+    for s in spans {
+        let start = json.get_int(s, "start_ms").unwrap_or(0);
+        let end = start + (json.get_float(s, "duration_ms").unwrap_or(0.0) as int);
+        if (t0 == 0 || start < t0) {
+            t0 = start;
+        }
+        if (end > t1) {
+            t1 = end;
+        }
+    }
+    let width = 40;
+    let total = if (t1 > t0) { t1 - t0 } else { 1 };
+    for s in spans {
+        let start = json.get_int(s, "start_ms").unwrap_or(0);
+        let dur = json.get_float(s, "duration_ms").unwrap_or(0.0);
+        let from = (start - t0) * width / total;
+        var len = (dur as int) * width / total;
+        if (len < 1) {
+            len = 1;
+        }
+        let indent = "  ".repeat(json.get_int(s, "depth").unwrap_or(0));
+        let label = "${indent}${json.get_string(s, "service").unwrap_or("")} ${json.get_string(s, "name").unwrap_or("")}";
+        let bar = " ".repeat(from) + "█".repeat(len);
+        let status = json.get_string(s, "status").unwrap_or("ok");
+        print(
+            "${label.substring(0, if (label.len() > 36) { 36 } else { label.len() })}${" ".repeat(if (label.len() < 36) { 36 - label.len() } else { 0 })} |${bar}${" ".repeat(if (from + len < width) { width - from - len } else { 0 })}| ${dur} ms ${if (status == "ok") { "" } else { status }}"
+        );
+    }
+    let logs = json.get_array(j, "logs").unwrap_or([]);
+    if (logs.len() > 0) {
+        print("");
+        for l in logs {
+            print(log_text(l));
+        }
+    }
+    Result.Ok(0)
+}
+
+fn query(argv: [string]) -> Result<int, string> {
+    let sel = argv.slice(1, argv.len()).filter(fn(a: string) -> bool { !a.starts_with("--") });
+    if (sel.len() == 0) {
+        return Result.Err("query needs a selector");
+    }
+    let qs = q(
+        [
+            ("m", sel[0]),
+            ("fn", flag(argv, "--fn", "last")),
+            ("step", flag(argv, "--step", "1m")),
+            ("since", flag(argv, "--since", "1h")),
+            ("sum", if (has(argv, "--sum")) { "1" } else { "" })
+        ]
+    );
+    let j = get(argv, "/v1/query?${qs}")?;
+    for s in json.get_array(j, "series").unwrap_or([]) {
+        print("{${json.get_string(s, "labels").unwrap_or("")}}");
+        for p in json.get_array(s, "points").unwrap_or([]) {
+            let t = json.as_int(json.at(p, 0).unwrap_or(json.Json.JNull)).unwrap_or(0);
+            let v = json.as_float(json.at(p, 1).unwrap_or(json.Json.JNull)).unwrap_or(0.0);
+            print("  ${time.to_iso8601(time.from_epoch_millis(t))}  ${v}");
+        }
+    }
+    Result.Ok(0)
+}
+
+// --- blast ---
+
+fn blast(argv: [string]) -> Result<int, string> {
+    let n = parse_int(flag(argv, "-n", "200000")).unwrap_or(200000);
+    let c = parse_int(flag(argv, "-c", "8")).unwrap_or(8);
+    let b = parse_int(flag(argv, "-b", "500")).unwrap_or(500);
+    let base = api(argv);
+    let h = headers(argv);
+    let per = n / c / b;
+    let done: Channel<(int, int)> = Channel.bounded(c);
+    let t0 = time.now();
+    for w in 0..c {
+        spawn(fn() {
+            var ok = 0;
+            var failed = 0;
+            for i in 0..per {
+                var lines: [string] = [];
+                for j in 0..b {
+                    lines.push(
+                        `{"level":"info","service":"blast${w % 4}","trace_id":"${w}-${i}","msg":"request handled","n":${i * b + j},"path":"/api/items/${j % 97}"}`
+                    );
+                }
+                match (http.request_pairs(
+                    "POST",
+                    "${base}/v1/logs",
+                    join(lines, "\n").to_bytes(),
+                    h,
+                    30000
+                )) {
+                    Result.Ok(r) => if (r.status == 200) {
+                        ok = ok + b;
+                    } else {
+                        failed = failed + b;
+                    },
+                    Result.Err(_) => failed = failed + b,
+                }
+            }
+            send(done, (ok, failed));
+        });
+    }
+    var ok = 0;
+    var failed = 0;
+    for _ in 0..c {
+        match (recv(done)) {
+            Option.Some((o, f)) => {
+                ok = ok + o;
+                failed = failed + f;
+            },
+            Option.None => { },
+        }
+    }
+    let ms = time.now() - t0;
+    print(
+        "${ok} lines stored, ${failed} failed, in ${ms} ms: ${if (ms > 0) { ok * 1000 / ms } else { 0 }} lines/s (${c} clients, ${b} lines per request, each acknowledged after fsync)"
+    );
+    Result.Ok(0)
+}
+
+fn main() -> int {
+    let argv = args();
+    if (argv.len() == 0 || argv[0] == "--help" || argv[0] == "-h") {
+        print(usage());
+        return if (argv.len() == 0) { 2 } else { 0 };
+    }
+    let r = match (argv[0]) {
+        "serve" => serve(argv),
+        "ship" => ship(argv),
+        "logs" => logs(argv),
+        "trace" => trace(argv),
+        "query" => query(argv),
+        "blast" => blast(argv),
+        "--version" => {
+            print(VERSION);
+            Result.Ok(0)
+        },
+        other => Result.Err("unknown command '${other}'\n\n${usage()}"),
+    };
+    match (r) {
+        Result.Ok(n) => n,
+        Result.Err(e) => {
+            eprint("rayobs: ${e}");
+            1
+        },
+    }
+}

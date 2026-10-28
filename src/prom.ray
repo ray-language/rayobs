@@ -1,0 +1,156 @@
+//! The Prometheus text exposition format (what `/metrics` serves): samples with their labels in
+//! a canonical order, so the same series always has the same key.
+
+pub struct Sample {
+    name: string,
+    /// `k="v",…` sorted by label name; "" when there are none.
+    labels: string,
+    value: float,
+}
+
+/// Parses a page. Comments and blank lines are skipped; a malformed line is counted, not fatal.
+pub fn parse(text: string) -> ([Sample], int) {
+    var out: [Sample] = [];
+    var bad = 0;
+    for raw in text.split("\n") {
+        let line = raw.trim();
+        if (line == "" || line.starts_with("#")) {
+            continue;
+        }
+        match (parse_sample(line)) {
+            Option.Some(s) => out.push(s),
+            Option.None => bad = bad + 1,
+        }
+    }
+    (out, bad)
+}
+
+fn parse_sample(line: string) -> Option<Sample> {
+    let brace = line.index_of("{");
+    let space = line.index_of(" ")?;
+    let (name, labels, rest) = match (brace) {
+        Option.Some(b) => if (b < space) {
+            let close = closing(line, b)?;
+            (
+                line.substring(0, b),
+                canonical(parse_labels(line.substring(b + 1, close))?),
+                line.substring(close + 1, line.len()).trim()
+            )
+        } else {
+            (line.substring(0, space), "", line.substring(space + 1, line.len()).trim())
+        },
+        Option.None => (line.substring(0, space), "", line.substring(space + 1, line.len()).trim()),
+    };
+    if (name == "") {
+        return Option.None;
+    }
+    // The value, then an optional timestamp (ignored: the scrape time is used).
+    let v = rest.split(" ")[0];
+    let value = match (v) {
+        "+Inf" => 1e308 * 10.0,
+        "-Inf" => -1e308 * 10.0,
+        "NaN" => return Option.None,
+        _ => parse_float(v)?,
+    };
+    Option.Some(Sample { name: name, labels: labels, value: value })
+}
+
+// The `}` that closes the label set opened at `open`, skipping quoted values.
+fn closing(line: string, open: int) -> Option<int> {
+    var quoted = false;
+    var escaped = false;
+    var i = open + 1;
+    while (i < line.len()) {
+        let c = line[i];
+        if (escaped) {
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if (c == '"') {
+            quoted = !quoted;
+        } else if (c == '}' && !quoted) {
+            return Option.Some(i);
+        }
+        i = i + 1;
+    }
+    Option.None
+}
+
+/// `a="1",b="x\"y"` → [("a", "1"), ("b", "x\"y")] (values kept escaped).
+pub fn parse_labels(s: string) -> Option<[(string, string)]> {
+    var out: [(string, string)] = [];
+    var i = 0;
+    let n = s.len();
+    while (i < n) {
+        while (i < n && (s[i] == ' ' || s[i] == ',')) {
+            i = i + 1;
+        }
+        if (i >= n) {
+            break;
+        }
+        let eq = i + s.substring(i, n).index_of("=")?;
+        let key = s.substring(i, eq).trim();
+        if (eq + 1 >= n || s[eq + 1] != '"') {
+            return Option.None;
+        }
+        var j = eq + 2;
+        var escaped = false;
+        while (j < n) {
+            if (escaped) {
+                escaped = false;
+            } else if (s[j] == '\\') {
+                escaped = true;
+            } else if (s[j] == '"') {
+                break;
+            }
+            j = j + 1;
+        }
+        if (j >= n) {
+            return Option.None;
+        }
+        out.push((key, s.substring(eq + 2, j)));
+        i = j + 1;
+    }
+    Option.Some(out)
+}
+
+pub fn canonical(labels: [(string, string)]) -> string {
+    let sorted = sort_by(labels, fn(a: (string, string), b: (string, string)) -> bool {
+        let (ka, _) = a;
+        let (kb, _) = b;
+        ka < kb
+    });
+    join(sorted.map(fn(p: (string, string)) -> string {
+        let (k, v) = p;
+        "${k}=\"${v}\""
+    }), ",")
+}
+
+/// Adds labels to a canonical set (a scrape's `job` and `instance`); existing names win.
+pub fn with_labels(labels: string, extra: [(string, string)]) -> string {
+    var all = parse_labels(labels).unwrap_or([]);
+    let names = all.map(fn(p: (string, string)) -> string {
+        let (k, _) = p;
+        k
+    });
+    for (k, v) in extra {
+        if (!names.contains(k)) {
+            all.push((k, v));
+        }
+    }
+    canonical(all)
+}
+
+/// Whether a canonical label set has every `k="v"` of `want`.
+pub fn matches(labels: string, want: [(string, string)]) -> bool {
+    if (want.len() == 0) {
+        return true;
+    }
+    let have = parse_labels(labels).unwrap_or([]);
+    for w in want {
+        if (!have.contains(w)) {
+            return false;
+        }
+    }
+    true
+}

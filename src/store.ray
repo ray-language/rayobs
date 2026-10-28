@@ -1,0 +1,409 @@
+//! The store for one signal (logs, spans or metrics): append-only segments of one hour each,
+//! `<data>/<signal>/YYYYMMDDHH.seg`, one record per line:
+//!
+//! ```
+//! <ts ms> TAB <a> TAB <b> TAB <body>
+//! ```
+//!
+//! `a` and `b` are what queries filter on without parsing the body (a service and a trace id,
+//! or a metric name and its labels). Retention deletes whole segments; a query opens only the
+//! segments its time range touches.
+//!
+//! One fiber writes. It gathers what arrives during a short window, writes it, syncs every
+//! segment it touched once, and only then acknowledges every producer of that window: group
+//! commit, so durability costs one fsync per window instead of one per record.
+
+import std/fs;
+import std/time;
+
+pub struct Rec {
+    ts: int,
+    a: string,
+    b: string,
+    body: string,
+}
+
+pub struct Stats {
+    records: int,
+    batches: int,
+    syncs: int,
+    written: int,
+    segments: int,
+    dropped_segments: int,
+}
+
+pub enum Msg {
+    Append([Rec], Channel<Result<int, string>>),
+    Stats(Channel<Stats>),
+    /// Close idle segments and apply retention now (it also runs every 30 s).
+    Housekeep(Channel<int>),
+    Stop(Channel<int>),
+}
+
+pub const HOUR_MS: int = 3600000;
+
+/// The segment a timestamp falls in: `YYYYMMDDHH` (UTC).
+pub fn segment_of(ts: int) -> string {
+    let d = time.from_epoch_millis(ts);
+    let two = fn(n: int) -> string {
+        if (n < 10) { "0${n}" } else { to_string(n) }
+    };
+    "${d.year}${two(d.month)}${two(d.day)}${two(d.hour)}"
+}
+
+/// Where segment `name` starts, in ms.
+pub fn segment_start(name: string) -> Option<int> {
+    if (name.len() != 10) {
+        return Option.None;
+    }
+    let iso = "${name.substring(0, 4)}-${name.substring(4, 6)}-${name.substring(6, 8)}T${name.substring(8, 10)}:00:00Z";
+    time.parse_iso8601_millis(iso).ok()
+}
+
+// Header fields cannot hold the separators.
+fn clean(s: string) -> string {
+    if (s.contains("\t") || s.contains("\n")) {
+        s.replace("\t", " ").replace("\n", " ")
+    } else {
+        s
+    }
+}
+
+pub fn line_of(r: Rec) -> string {
+    "${r.ts}\t${clean(r.a)}\t${clean(r.b)}\t${r.body.replace("\n", " ")}"
+}
+
+/// Splits a stored line back. `None` for a line cut short by a crash.
+pub fn parse_line(line: string) -> Option<Rec> {
+    let t1 = line.index_of("\t")?;
+    let ts = parse_int(line.substring(0, t1))?;
+    let rest = line.substring(t1 + 1, line.len());
+    let t2 = rest.index_of("\t")?;
+    let rest2 = rest.substring(t2 + 1, rest.len());
+    let t3 = rest2.index_of("\t")?;
+    Option.Some(
+        Rec {
+            ts: ts,
+            a: rest.substring(0, t2),
+            b: rest2.substring(0, t3),
+            body: rest2.substring(t3 + 1, rest2.len())
+        }
+    )
+}
+
+fn dir_of(data: string, signal: string) -> string {
+    "${data}/${signal}"
+}
+
+struct Pending {
+    recs: [Rec],
+    reply: Channel<Result<int, string>>,
+}
+
+struct W {
+    dir: string,
+    handles: Map<string, int>,
+    stats: Stats,
+    retention_ms: int,
+}
+
+/// Starts the writer of one signal. `window_ms` is how long it gathers before a commit;
+/// `retention_ms` how old a segment may get (0 = forever).
+pub fn start(
+    data: string,
+    signal: string,
+    window_ms: int,
+    retention_ms: int
+) -> Result<Channel<Msg>, string> {
+    let dir = dir_of(data, signal);
+    fs.mkdir(dir)?;
+    let inbox: Channel<Msg> = Channel.bounded(4096);
+    spawn(fn() {
+        let w = W {
+            dir: dir,
+            handles: Map.new(),
+            stats: Stats { records: 0, batches: 0, syncs: 0, written: 0, segments: 0, dropped_segments: 0 },
+            retention_ms: retention_ms
+        };
+        writer(w, inbox, window_ms);
+    });
+    Result.Ok(inbox)
+}
+
+const MAX_BATCH: int = 20000;
+
+const HOUSEKEEP_MS: int = 30000;
+
+fn writer(w: W, inbox: Channel<Msg>, window_ms: int) {
+    var housekeep_at = 0;
+    while (true) {
+        // Wait for the first record of a window (or a tick for housekeeping).
+        var pending: [Pending] = [];
+        var count = 0;
+        match (select_timeout([inbox], 1000)) {
+            Option.Some(_) => match (recv(inbox)) {
+                Option.Some(m) => if (!take(w, m, pending)) {
+                    return;
+                },
+                Option.None => return,
+            },
+            Option.None => { },
+        }
+        if (pending.len() > 0) {
+            count = pending[0].recs.len();
+            // Whatever queued up meanwhile (during the last fsync) joins this commit at once...
+            var more = true;
+            while (more && count < MAX_BATCH) {
+                match (try_recv(inbox)) {
+                    Received.Got(m) => {
+                        let before = pending.len();
+                        if (!take(w, m, pending)) {
+                            commit(w, pending);
+                            return;
+                        }
+                        if (pending.len() > before) {
+                            count = count + pending[pending.len() - 1].recs.len();
+                        }
+                    },
+                    _ => more = false,
+                }
+            }
+            // ...and with a window, more may join until it closes.
+            let end = time.now() + window_ms;
+            while (count < MAX_BATCH) {
+                let left = end - time.now();
+                if (left <= 0) {
+                    break;
+                }
+                match (select_timeout([inbox], left)) {
+                    Option.Some(_) => match (recv(inbox)) {
+                        Option.Some(m) => {
+                            let before = pending.len();
+                            if (!take(w, m, pending)) {
+                                commit(w, pending);
+                                return;
+                            }
+                            if (pending.len() > before) {
+                                count = count + pending[pending.len() - 1].recs.len();
+                            }
+                        },
+                        Option.None => break,
+                    },
+                    Option.None => break,
+                }
+            }
+            commit(w, pending);
+        }
+        let now = time.now();
+        if (now >= housekeep_at) {
+            housekeep(w, now);
+            housekeep_at = now + HOUSEKEEP_MS;
+        }
+    }
+}
+
+// false = stop.
+fn take(w: W, m: Msg, pending: [Pending]) -> bool {
+    match (m) {
+        Msg.Append(recs, reply) => pending.push(Pending { recs: recs, reply: reply }),
+        Msg.Stats(reply) => {
+            w.stats.segments = segments(w.dir).len();
+            send(reply, w.stats);
+        },
+        Msg.Housekeep(reply) => {
+            housekeep(w, time.now());
+            send(reply, 0);
+        },
+        Msg.Stop(reply) => {
+            for k in w.handles.keys() {
+                close(w.handles.get(k).unwrap());
+            }
+            send(reply, 0);
+            return false;
+        },
+    }
+    true
+}
+
+fn handle_for(w: W, seg: string) -> Result<int, string> {
+    match (w.handles.get(seg)) {
+        Option.Some(h) => Result.Ok(h),
+        Option.None => {
+            let h = fs.open("${w.dir}/${seg}.seg", "a")?;
+            w.handles.insert(seg, h);
+            Result.Ok(h)
+        },
+    }
+}
+
+// Writes the window, syncs each touched segment once, then answers everyone.
+fn commit(w: W, pending: [Pending]) {
+    if (pending.len() == 0) {
+        return;
+    }
+    // Group the window's lines by segment: one write per segment.
+    let by: Map<string, [string]> = Map.new();
+    var n = 0;
+    for p in pending {
+        for r in p.recs {
+            let seg = segment_of(r.ts);
+            let lines = by.get_or(seg, []);
+            lines.push(line_of(r));
+            by.insert(seg, lines);
+            n = n + 1;
+        }
+    }
+    var result: Result<int, string> = Result.Ok(n);
+    for seg in by.keys() {
+        let text = join(by.get(seg).unwrap(), "\n") + "\n";
+        let r = write_segment(w, seg, text);
+        match (r) {
+            Result.Ok(_) => w.stats.written = w.stats.written + text.len(),
+            Result.Err(e) => result = Result.Err("${seg}: ${e}"),
+        }
+    }
+    if (result.is_ok()) {
+        w.stats.records = w.stats.records + n;
+    }
+    w.stats.batches = w.stats.batches + 1;
+    for p in pending {
+        let mine: Result<int, string> = match (result) {
+            Result.Ok(_) => Result.Ok(p.recs.len()),
+            Result.Err(e) => Result.Err(e),
+        };
+        send(p.reply, mine);
+    }
+}
+
+fn write_segment(w: W, seg: string, text: string) -> Result<int, string> {
+    let h = handle_for(w, seg)?;
+    fs.write(h, text)?;
+    w.stats.syncs = w.stats.syncs + 1;
+    fs.sync_data(h)
+}
+
+// Closes handles of segments no longer written, and drops segments past retention.
+fn housekeep(w: W, now: int) {
+    let current = segment_of(now);
+    let previous = segment_of(now - HOUR_MS);
+    for seg in w.handles.keys() {
+        if (seg != current && seg != previous) {
+            close(w.handles.get(seg).unwrap());
+            w.handles.remove(seg);
+        }
+    }
+    if (w.retention_ms <= 0) {
+        return;
+    }
+    for seg in segments(w.dir) {
+        match (segment_start(seg)) {
+            Option.Some(start) => if (start + HOUR_MS < now - w.retention_ms) {
+                match (w.handles.get(seg)) {
+                    Option.Some(h) => {
+                        close(h);
+                        w.handles.remove(seg);
+                    },
+                    Option.None => { },
+                }
+                fs.remove_file("${w.dir}/${seg}.seg");
+                w.stats.dropped_segments = w.stats.dropped_segments + 1;
+            },
+            Option.None => { },
+        }
+    }
+}
+
+/// The segments on disk, oldest first.
+pub fn segments(dir: string) -> [string] {
+    var out: [string] = [];
+    match (fs.list_dir(dir)) {
+        Result.Ok(names) => {
+            for n in names {
+                match (n.strip_suffix(".seg")) {
+                    Option.Some(s) => out.push(s),
+                    Option.None => { },
+                }
+            }
+        },
+        Result.Err(_) => { },
+    }
+    sort(out)
+}
+
+/// What a scan keeps: `a` and `b` exact (empty = any), `text` a substring of the whole line.
+pub struct Filter {
+    a: string,
+    b: string,
+    text: string,
+}
+
+/// The records in [from, to) that pass `f`, oldest first, at most `limit` (the newest `limit`
+/// when there are more). Runs in the caller's fiber: it only reads files, and only the
+/// segments the range touches.
+pub fn scan(data: string, signal: string, from: int, to: int, f: Filter, limit: int) -> [Rec] {
+    let dir = dir_of(data, signal);
+    var out: [Rec] = [];
+    for seg in segments(dir) {
+        let start = segment_start(seg).unwrap_or(0);
+        // A record lands in the segment of its own ts, so the segment's hour bounds it.
+        if (start + HOUR_MS <= from || start >= to) {
+            continue;
+        }
+        let h = match (fs.open("${dir}/${seg}.seg", "r")) {
+            Result.Ok(h) => h,
+            Result.Err(_) => continue,
+        };
+        while (true) {
+            match (fs.read_line(h)) {
+                Option.Some(line) => {
+                    if (f.text != "" && !line.contains(f.text)) {
+                        continue;
+                    }
+                    match (parse_line(line)) {
+                        Option.Some(r) => if (r.ts >= from
+                            && r.ts < to
+                            && (f.a == "" || r.a == f.a)
+                            && (f.b == "" || r.b == f.b)) {
+                            out.push(r);
+                            if (out.len() > limit * 2) {
+                                out = out.slice(out.len() - limit, out.len());
+                            }
+                        },
+                        Option.None => { },
+                    }
+                },
+                Option.None => break,
+            }
+        }
+        close(h);
+    }
+    // Lines of one segment can be out of order across producers: order by time.
+    let sorted = sort_by(out, fn(x: Rec, y: Rec) -> bool { x.ts < y.ts });
+    if (sorted.len() > limit) { sorted.slice(sorted.len() - limit, sorted.len()) } else { sorted }
+}
+
+pub fn append(s: Channel<Msg>, recs: [Rec]) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(s, Msg.Append(recs, r));
+    recv(r).unwrap_or(Result.Err("store stopped"))
+}
+
+pub fn stats(s: Channel<Msg>) -> Stats {
+    let r: Channel<Stats> = Channel.bounded(1);
+    send(s, Msg.Stats(r));
+    recv(r).unwrap_or(
+        Stats { records: 0, batches: 0, syncs: 0, written: 0, segments: 0, dropped_segments: 0 }
+    )
+}
+
+pub fn housekeep_now(s: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(s, Msg.Housekeep(r));
+    recv(r);
+}
+
+pub fn stop(s: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(s, Msg.Stop(r));
+    recv(r);
+}

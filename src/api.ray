@@ -1,0 +1,290 @@
+//! The API, JSON over HTTP.
+//!
+//! ```
+//! POST /v1/logs[?service=S]         NDJSON, or plain text lines          {accepted}
+//! POST /v1/spans                    a JSON array of spans, or NDJSON      {accepted}
+//! POST /v1/metrics?job=J            an exposition page (push)            {accepted, bad}
+//! GET  /v1/logs?service=&trace_id=&level=&q=&limit=      the newest lines, oldest first
+//! GET  /v1/traces/ID                the spans of a trace, as a tree, and its logs
+//! GET  /v1/query?m=SELECTOR&step=1m&fn=rate&sum=1        metric series
+//! GET  /v1/stats                    what each writer has done
+//! ```
+//!
+//! Reads take a time range: `since=1h` (the default), or `from` and `to` (epoch ms or RFC 3339).
+//! Writes answer once the records are synced to disk.
+
+import std/json;
+import std/time;
+import net/webserver;
+import config;
+import ingest;
+import metrics;
+import store;
+
+pub struct Ctx {
+    cfg: config.Config,
+    logs: Channel<store.Msg>,
+    spans: Channel<store.Msg>,
+    metrics: Channel<store.Msg>,
+}
+
+const MAX_LIMIT: int = 10000;
+
+fn reply(status: int, j: json.Json) -> webserver.Response {
+    let r = webserver.bytes_response(status, json.stringify(j).to_bytes());
+    r.headers.insert("Content-Type", "application/json");
+    r
+}
+
+fn obj(pairs: [(string, json.Json)]) -> json.Json {
+    let m: Map<string, json.Json> = Map.new();
+    for (k, v) in pairs {
+        m.insert(k, v);
+    }
+    json.Json.JObject(m)
+}
+
+fn error(status: int, message: string) -> webserver.Response {
+    reply(status, obj([("error", json.Json.JStr(message))]))
+}
+
+fn num(n: int) -> json.Json {
+    json.Json.JNum(n as float)
+}
+
+fn instant(s: string) -> Option<int> {
+    match (parse_int(s)) {
+        Option.Some(n) => Option.Some(n),
+        Option.None => time.parse_iso8601_millis(s).ok(),
+    }
+}
+
+/// The [from, to) of a read.
+pub fn range_of(q: Map<string, string>, now: int) -> Result<(int, int), string> {
+    if (q.contains_key("from")) {
+        let from = instant(q.get_or("from", "")).ok_or("bad from")?;
+        let to = if (q.contains_key("to")) {
+            instant(q.get_or("to", "")).ok_or("bad to")?
+        } else {
+            now + 1
+        };
+        return Result.Ok((from, to));
+    }
+    let since = config.duration_ms(q.get_or("since", "1h")).ok_or("bad since (like 15m, 6h, 2d)")?;
+    Result.Ok((now - since, now + 1))
+}
+
+pub fn handle(ctx: Ctx, req: webserver.Request) -> webserver.Response {
+    if (ctx.cfg.token != ""
+        && req.headers.get_or("authorization", "") != "Bearer ${ctx.cfg.token}") {
+        return error(401, "a bearer token is required");
+    }
+    let q = webserver.query_params(req);
+    let now = time.now();
+    match ((req.method, req.path)) {
+        ("POST", "/v1/logs") => {
+            let text = webserver.request_text(req).unwrap_or("");
+            accepted(
+                store.append(ctx.logs, ingest.logs(text, q.get_or("service", "unknown"), now)),
+                0
+            )
+        },
+        ("POST", "/v1/spans") => match (ingest.spans(webserver.request_text(req).unwrap_or(""))) {
+            Result.Ok(recs) => accepted(store.append(ctx.spans, recs), 0),
+            Result.Err(e) => error(400, e),
+        },
+        ("POST", "/v1/metrics") => {
+            let (recs, bad) = ingest.pushed(
+                webserver.request_text(req).unwrap_or(""),
+                q.get_or("job", ""),
+                now
+            );
+            accepted(store.append(ctx.metrics, recs), bad)
+        },
+        ("GET", "/v1/logs") => logs(ctx, q, now),
+        ("GET", "/v1/query") => query(ctx, q, now),
+        ("GET", "/v1/stats") => stats(ctx),
+        // Not a guarded arm: one breaks the native build here (finding).
+        _ => if (req.method == "GET" && req.path.starts_with("/v1/traces/")) {
+            trace(ctx, req.path.substring(11, req.path.len()), q, now)
+        } else {
+            error(404, "no such endpoint")
+        },
+    }
+}
+
+fn accepted(r: Result<int, string>, bad: int) -> webserver.Response {
+    match (r) {
+        Result.Ok(n) => reply(200, obj([("accepted", num(n)), ("bad", num(bad))])),
+        Result.Err(e) => error(500, e),
+    }
+}
+
+// A stored log as JSON again, with its time.
+fn log_json(r: store.Rec) -> json.Json {
+    let m = match (json.parse(r.body)) {
+        Result.Ok(json.Json.JObject(m)) => m,
+        _ => Map.new(),
+    };
+    m.insert("ts", json.Json.JStr(time.to_iso8601(time.from_epoch_millis(r.ts))));
+    m.insert("ts_ms", num(r.ts));
+    json.Json.JObject(m)
+}
+
+fn limit_of(q: Map<string, string>, default: int) -> int {
+    let n = parse_int(q.get_or("limit", to_string(default))).unwrap_or(default);
+    if (n < 1) { 1 } else if (n > MAX_LIMIT) { MAX_LIMIT } else { n }
+}
+
+fn logs(ctx: Ctx, q: Map<string, string>, now: int) -> webserver.Response {
+    let (from, to) = match (range_of(q, now)) {
+        Result.Ok(r) => r,
+        Result.Err(e) => return error(400, e),
+    };
+    let level = q.get_or("level", "").to_lower();
+    let text = q.get_or("q", "");
+    // The cheapest filter goes to the scan; the other is applied after.
+    let first = if (level != "") { "\"level\":\"${level}\"" } else { text };
+    let f = store.Filter { a: q.get_or("service", ""), b: q.get_or("trace_id", ""), text: first };
+    let recs = store.scan(
+        ctx.cfg.data,
+        "logs",
+        from,
+        to,
+        f,
+        if (level != "" && text != "") { MAX_LIMIT * 10 } else { limit_of(q, 100) }
+    );
+    var out: [json.Json] = [];
+    for r in recs {
+        if (level == "" || text == "" || r.body.contains(text)) {
+            out.push(log_json(r));
+        }
+    }
+    let lim = limit_of(q, 100);
+    if (out.len() > lim) {
+        out = out.slice(out.len() - lim, out.len());
+    }
+    reply(200, obj([("logs", json.Json.JArray(out))]))
+}
+
+fn trace(ctx: Ctx, id: string, q: Map<string, string>, now: int) -> webserver.Response {
+    if (id.len() != 32) {
+        return error(400, "a trace id is 32 hex digits");
+    }
+    let qq: Map<string, string> = Map.new();
+    for k in q.keys() {
+        qq.insert(k, q.get_or(k, ""));
+    }
+    if (!qq.contains_key("since") && !qq.contains_key("from")) {
+        qq.insert("since", "1d");
+    }
+    let (from, to) = match (range_of(qq, now)) {
+        Result.Ok(r) => r,
+        Result.Err(e) => return error(400, e),
+    };
+    let f = store.Filter { a: "", b: id, text: "" };
+    let spans = store.scan(ctx.cfg.data, "spans", from, to, f, MAX_LIMIT);
+    let logs = store.scan(ctx.cfg.data, "logs", from, to, f, MAX_LIMIT);
+    // Depth of each span: how many parents up to a root (or to a parent that never arrived).
+    let parent: Map<string, string> = Map.new();
+    var parsed: [Map<string, json.Json>] = [];
+    for r in spans {
+        match (json.parse(r.body)) {
+            Result.Ok(json.Json.JObject(m)) => {
+                parent.insert(
+                    json.get_string(json.Json.JObject(m), "span_id").unwrap_or(""),
+                    json.get_string(json.Json.JObject(m), "parent_id").unwrap_or("")
+                );
+                parsed.push(m);
+            },
+            _ => { },
+        }
+    }
+    var out: [json.Json] = [];
+    for m in parsed {
+        var depth = 0;
+        var p = json.get_string(json.Json.JObject(m), "parent_id").unwrap_or("");
+        while (p != "" && parent.contains_key(p) && depth < 64) {
+            depth = depth + 1;
+            p = parent.get_or(p, "");
+        }
+        m.insert("depth", num(depth));
+        out.push(json.Json.JObject(m));
+    }
+    if (out.len() == 0 && logs.len() == 0) {
+        return error(404, "no spans or logs for that trace in the range");
+    }
+    reply(
+        200,
+        obj(
+            [
+                ("trace_id", json.Json.JStr(id)),
+                ("spans", json.Json.JArray(out)),
+                ("logs", json.Json.JArray(logs.map(log_json)))
+            ]
+        )
+    )
+}
+
+fn query(ctx: Ctx, q: Map<string, string>, now: int) -> webserver.Response {
+    let (name, matchers) = match (metrics.parse_selector(q.get_or("m", ""))) {
+        Option.Some(v) => v,
+        Option.None => return error(400, "m must be a selector like name{k=\"v\"}"),
+    };
+    if (name == "") {
+        return error(400, "m is required");
+    }
+    let (from, to) = match (range_of(q, now)) {
+        Result.Ok(r) => r,
+        Result.Err(e) => return error(400, e),
+    };
+    let step = config.duration_ms(q.get_or("step", "1m")).unwrap_or(0);
+    let mq = metrics.Query {
+        name: name,
+        matchers: matchers,
+        from: from,
+        to: to,
+        step: step,
+        func: q.get_or("fn", "last"),
+        sum: q.get_or("sum", "") == "1"
+    };
+    match (metrics.run(ctx.cfg.data, mq)) {
+        Result.Ok(series) => {
+            let xs = series.map(fn(s: metrics.Series) -> json.Json {
+                let pts = s.points.map(fn(p: (int, float)) -> json.Json {
+                    let (t, v) = p;
+                    json.Json.JArray([num(t), json.Json.JNum(v)])
+                });
+                obj([("labels", json.Json.JStr(s.labels)), ("points", json.Json.JArray(pts))])
+            });
+            reply(200, obj([("series", json.Json.JArray(xs))]))
+        },
+        Result.Err(e) => error(400, e),
+    }
+}
+
+fn stats_json(s: store.Stats) -> json.Json {
+    obj(
+        [
+            ("records", num(s.records)),
+            ("batches", num(s.batches)),
+            ("syncs", num(s.syncs)),
+            ("bytes_written", num(s.written)),
+            ("segments", num(s.segments)),
+            ("dropped_segments", num(s.dropped_segments))
+        ]
+    )
+}
+
+fn stats(ctx: Ctx) -> webserver.Response {
+    reply(
+        200,
+        obj(
+            [
+                ("logs", stats_json(store.stats(ctx.logs))),
+                ("spans", stats_json(store.stats(ctx.spans))),
+                ("metrics", stats_json(store.stats(ctx.metrics)))
+            ]
+        )
+    )
+}

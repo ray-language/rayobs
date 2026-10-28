@@ -1,0 +1,18 @@
+# rayobs configuration. Copy to rayobs.toml.
+
+[server]
+listen = "127.0.0.1:9400"
+data = "data"
+retention = "7d"        # whole hours older than this are deleted
+commit_ms = 0           # extra wait to gather a commit; 0 = what queued during the last fsync
+token = ""              # bearer token for every request ("" = open)
+
+[[scrape]]
+job = "raystat"
+url = "http://127.0.0.1:9102/metrics"
+interval = "15s"
+
+[[scrape]]
+job = "raygate"
+url = "http://127.0.0.1:8080/metrics"
+interval = "15s"

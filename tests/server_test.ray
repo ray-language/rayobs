@@ -1,0 +1,187 @@
+// The service end to end, in one test (OS listeners outlive a test's fibers): a scrape target
+// served here, logs in net/log's JSON and as plain text, a trace of three hops whose logs carry
+// its id, pushed metrics, and everything still there after a restart.
+
+import std/fs;
+import std/json;
+import std/net;
+import std/time;
+import net/http;
+import net/log;
+import net/trace;
+import net/webserver;
+import config;
+import server;
+
+fn boot(data: string, target_port: int) -> server.Running {
+    let src = `
+[server]
+listen = "127.0.0.1:0"
+data = "${data}"
+retention = "2d"
+commit_ms = 0
+
+[[scrape]]
+job = "app"
+url = "http://127.0.0.1:${target_port}/metrics"
+interval = "1s"
+`;
+    let cfg = config.parse(src).unwrap();
+    server.start(cfg, net.tcp_listen("127.0.0.1", 0).unwrap()).unwrap()
+}
+
+fn post(r: server.Running, path: string, body: string) -> int {
+    http.request_pairs("POST", "http://127.0.0.1:${r.port}${path}", body.to_bytes(), [], 10000)
+        .unwrap().status
+}
+
+fn get(r: server.Running, path: string) -> json.Json {
+    let resp = http.request_pairs("GET", "http://127.0.0.1:${r.port}${path}", bytes_of([]), [], 10000)
+        .unwrap();
+    json.parse(from_utf8(resp.body).unwrap()).unwrap()
+}
+
+fn count(j: json.Json, key: string) -> int {
+    json.get_array(j, key).unwrap_or([]).len()
+}
+
+fn span(
+    t: string,
+    id: string,
+    parent: string,
+    service: string,
+    name: string,
+    start: int,
+    dur: float
+) -> string {
+    `{"trace_id":"${t}","span_id":"${id}","parent_id":"${parent}","service":"${service}","name":"${name}","start_ms":${start},"duration_ms":${dur}}`
+}
+
+@test
+fn observability_end_to_end() {
+    // The target: a fixed exposition page.
+    let tl = net.tcp_listen("127.0.0.1", 0).unwrap();
+    let tport = net.local_port(tl);
+    let stop_target: Channel<int> = Channel.bounded(1);
+    spawn(fn() {
+        var o = webserver.options();
+        o.stop = stop_target;
+        o.has_stop = true;
+        o.no_stdout = true;
+        webserver.serve_options_on(tl, o, fn() -> fn(webserver.Request) -> webserver.Response {
+            fn(req: webserver.Request) -> webserver.Response {
+                webserver.text(
+                    200,
+                    "# TYPE hits_total counter\nhits_total{route=\"/\"} 42\nqueue_depth 7\n"
+                )
+            }
+        });
+    });
+    let data = fs.make_temp_dir("rayobs-e2e").unwrap();
+    let r = boot(data, tport);
+
+    // Logs: net/log's own lines, with and without a trace, and plain text.
+    let tr = trace.new_trace();
+    let lg = log.logger("orders");
+    let now_iso = time.to_iso8601(time.now_utc());
+    let lines = [
+        log.render(
+            log.field(log.info(log.with_trace(lg, tr.trace_id), "order received"), "order", "o-1"),
+            now_iso
+        ),
+        log.render(log.error(log.with_trace(lg, tr.trace_id), "payment declined"), now_iso),
+        log.render(log.info(log.logger("inventory"), "stock checked"), now_iso),
+        "a plain line from a script"
+    ];
+    assert_eq(post(r, "/v1/logs?service=cron", join(lines, "\n")), 200);
+
+    // A trace: front → orders → inventory.
+    let t = tr.trace_id;
+    let start = time.now() - 50;
+    let spans = "["
+        + join(
+            [
+                span(t, "a000000000000001", "", "front", "GET /checkout", start, 42.5),
+                span(t, "a000000000000002", "a000000000000001", "orders", "create", start + 2, 30.0),
+                span(
+                    t,
+                    "a000000000000003",
+                    "a000000000000002",
+                    "inventory",
+                    "reserve",
+                    start + 5,
+                    12.25
+                )
+            ],
+            ","
+        )
+        + "]";
+    assert_eq(post(r, "/v1/spans", spans), 200);
+    assert_eq(post(r, "/v1/spans", `{"trace_id":"short","span_id":"x"}`), 400);
+
+    // Pushed metrics.
+    assert_eq(
+        post(r, "/v1/metrics?job=batch", "# TYPE rows gauge\nrows{table=\"users\"} 1200\n"),
+        200
+    );
+
+    // Reads.
+    assert_eq(count(get(r, "/v1/logs"), "logs"), 4);
+    assert_eq(count(get(r, "/v1/logs?service=orders"), "logs"), 2);
+    assert_eq(count(get(r, "/v1/logs?service=cron"), "logs"), 1);
+    let errors = get(r, "/v1/logs?level=ERROR");
+    assert_eq(count(errors, "logs"), 1);
+    assert_eq(
+        json.get_string(json.get_array(errors, "logs").unwrap()[0], "msg").unwrap(),
+        "payment declined"
+    );
+    assert_eq(count(get(r, "/v1/logs?q=stock"), "logs"), 1);
+    assert_eq(count(get(r, "/v1/logs?trace_id=${t}"), "logs"), 2);
+    assert_eq(count(get(r, "/v1/logs?since=1ms&from=0&to=1"), "logs"), 0);
+
+    let tj = get(r, "/v1/traces/${t}");
+    let ss = json.get_array(tj, "spans").unwrap();
+    assert_eq(ss.len(), 3);
+    assert_eq(
+        ss.map(fn(s: json.Json) -> int { json.get_int(s, "depth").unwrap_or(-1) }),
+        [0, 1, 2]
+    );
+    assert_eq(count(tj, "logs"), 2);
+
+    // The scraper has run at least once (it starts right away).
+    time.sleep(300);
+    let up = get(r, "/v1/query?m=up&since=1m&step=1m&fn=last");
+    let series = json.get_array(up, "series").unwrap();
+    assert_eq(series.len(), 1);
+    assert_eq(
+        json.get_string(series[0], "labels").unwrap(),
+        `instance="127.0.0.1:${tport}",job="app"`
+    );
+    let hits = get(r, "/v1/query?m=hits_total{route=\"/\"}&since=1m&step=1m&fn=last");
+    assert_eq(json.get_array(hits, "series").unwrap().len(), 1);
+    let rows = get(r, "/v1/query?m=rows&since=1m&step=1m&fn=max");
+    let pts = json.get_array(json.get_array(rows, "series").unwrap()[0], "points").unwrap();
+    assert_eq(json.as_float(json.at(pts[0], 1).unwrap()).unwrap(), 1200.0);
+
+    let st = get(r, "/v1/stats");
+    assert_eq(
+        json.get_int(json.get_object(st, "logs")
+            .map(fn(m: Map<string, json.Json>) -> json.Json { json.Json.JObject(m) })
+            .unwrap(), "records")
+            .unwrap(),
+        4
+    );
+    server.stop(r);
+
+    // After a restart (the target gone), the stored data is all there and up turns 0.
+    send(stop_target, 1);
+    let r2 = boot(data, tport);
+    assert_eq(count(get(r2, "/v1/logs"), "logs"), 4);
+    assert_eq(json.get_array(get(r2, "/v1/traces/${t}"), "spans").unwrap().len(), 3);
+    time.sleep(300);
+    let down = get(r2, "/v1/query?m=up&since=1m&step=1m&fn=min");
+    let dp = json.get_array(json.get_array(down, "series").unwrap()[0], "points").unwrap();
+    assert_eq(json.as_float(json.at(dp[0], 1).unwrap()).unwrap(), 0.0);
+    server.stop(r2);
+    fs.remove_all(data);
+}

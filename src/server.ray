@@ -1,0 +1,73 @@
+//! Everything together: a writer per signal, a scraper per target, and the API.
+
+import std/fs;
+import std/net;
+import net/webserver;
+import api;
+import config;
+import scrape;
+import store;
+
+pub struct Running {
+    port: int,
+    logs: Channel<store.Msg>,
+    spans: Channel<store.Msg>,
+    metrics: Channel<store.Msg>,
+    stop_http: Channel<int>,
+    stop_scrapes: Channel<int>,
+    done: Channel<Result<int, string>>,
+}
+
+pub fn start(cfg: config.Config, listener: int) -> Result<Running, string> {
+    fs.mkdir(cfg.data)?;
+    let logs = store.start(cfg.data, "logs", cfg.commit_ms, cfg.retention_ms)?;
+    let spans = store.start(cfg.data, "spans", cfg.commit_ms, cfg.retention_ms)?;
+    let metrics = store.start(cfg.data, "metrics", cfg.commit_ms, cfg.retention_ms)?;
+    let stop_scrapes: Channel<int> = Channel.bounded(1);
+    for t in cfg.targets {
+        spawn(fn() {
+            scrape.run(t, metrics, stop_scrapes);
+        });
+    }
+    let stop_http: Channel<int> = Channel.bounded(1);
+    let done: Channel<Result<int, string>> = Channel.bounded(1);
+    let ctx = api.Ctx { cfg: cfg, logs: logs, spans: spans, metrics: metrics };
+    spawn(fn() {
+        var opts = webserver.options();
+        var limits = webserver.default_limits();
+        limits.max_body_bytes = 32 * 1024 * 1024;
+        opts.limits = limits;
+        opts.drain_ms = 2000;
+        opts.stop = stop_http;
+        opts.has_stop = true;
+        opts.no_stdout = true;
+        let r = webserver.serve_options_on(
+            listener,
+            opts,
+            fn() -> fn(webserver.Request) -> webserver.Response {
+                fn(req: webserver.Request) -> webserver.Response { api.handle(ctx, req) }
+            }
+        );
+        send(done, r);
+    });
+    Result.Ok(
+        Running {
+            port: net.local_port(listener),
+            logs: logs,
+            spans: spans,
+            metrics: metrics,
+            stop_http: stop_http,
+            stop_scrapes: stop_scrapes,
+            done: done
+        }
+    )
+}
+
+pub fn stop(r: Running) {
+    close(r.stop_scrapes);
+    send(r.stop_http, 1);
+    recv(r.done);
+    store.stop(r.logs);
+    store.stop(r.spans);
+    store.stop(r.metrics);
+}

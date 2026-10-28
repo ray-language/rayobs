@@ -1,0 +1,121 @@
+// The store on its own: group commit under concurrent producers, scans by time and filter,
+// a line cut short by a crash, and retention.
+
+import std/fs;
+import std/time;
+import store;
+
+fn rec(ts: int, a: string, b: string, body: string) -> store.Rec {
+    store.Rec { ts: ts, a: a, b: b, body: body }
+}
+
+@test
+fn segments_by_hour() {
+    let t = 1793232000000;
+    assert_eq(store.segment_of(t), "2026102900");
+    assert_eq(store.segment_start("2026102900"), Option.Some(t));
+    assert_eq(store.segment_of(t + store.HOUR_MS - 1), "2026102900");
+    assert_eq(store.segment_of(t + store.HOUR_MS), "2026102901");
+    let r = rec(5, "api\tx", "t1", "{\"msg\":\"a\nb\"}");
+    assert_eq(store.parse_line(store.line_of(r)).unwrap().a, "api x");
+    assert(store.parse_line("12\tonly-two").is_none());
+}
+
+@test
+fn group_commit_and_scans() {
+    let data = fs.make_temp_dir("rayobs-store").unwrap();
+    let s = store.start(data, "logs", 30, 0).unwrap();
+    let now = time.now();
+    let done: Channel<int> = Channel.bounded(20);
+    // 20 producers, 50 appends of 10 records each, all at once.
+    for p in 0..20 {
+        spawn(fn() {
+            for i in 0..50 {
+                var batch: [store.Rec] = [];
+                for j in 0..10 {
+                    batch.push(rec(now + i, "svc${p % 4}", "trace${p}", "{\"n\":${i * 10 + j}}"));
+                }
+                store.append(s, batch).unwrap();
+            }
+            send(done, 1);
+        });
+    }
+    for _ in 0..20 {
+        recv(done);
+    }
+    let st = store.stats(s);
+    assert_eq(st.records, 10000);
+    // 1000 appends, far fewer syncs: that is the point of the window.
+    assert(st.syncs < 200);
+    let all = store.scan(
+        data,
+        "logs",
+        now - 1000,
+        now + 1000,
+        store.Filter { a: "", b: "", text: "" },
+        100000
+    );
+    assert_eq(all.len(), 10000);
+    let one = store.scan(
+        data,
+        "logs",
+        now - 1000,
+        now + 1000,
+        store.Filter { a: "svc1", b: "trace5", text: "" },
+        100000
+    );
+    assert_eq(one.len(), 500);
+    let text = store.scan(
+        data,
+        "logs",
+        now - 1000,
+        now + 1000,
+        store.Filter { a: "", b: "", text: "\"n\":499}" },
+        100000
+    );
+    assert_eq(text.len(), 20);
+    // limit keeps the newest.
+    let last = store.scan(
+        data,
+        "logs",
+        now - 1000,
+        now + 1000,
+        store.Filter { a: "", b: "", text: "" },
+        7
+    );
+    assert_eq((last.len(), last[6].ts), (7, now + 49));
+    assert_eq(
+        store.scan(data, "logs", now + 1000, now + 2000, store.Filter { a: "", b: "", text: "" }, 10)
+            .len(),
+        0
+    );
+    store.stop(s);
+    // A crash cut the last line short: scans skip it.
+    let seg = "${data}/logs/${store.segment_of(now)}.seg";
+    fs.append_file(seg, "123\tbroken");
+    assert_eq(
+        store.scan(data, "logs", now - 1000, now + 1000, store.Filter { a: "", b: "", text: "" }, 100000)
+            .len(),
+        10000
+    );
+    fs.remove_all(data);
+}
+
+@test
+fn retention_drops_old_segments() {
+    let data = fs.make_temp_dir("rayobs-ret").unwrap();
+    let s = store.start(data, "metrics", 10, 2 * store.HOUR_MS).unwrap();
+    let now = time.now();
+    store.append(s, [
+        rec(now - 5 * store.HOUR_MS, "m", "", "1"),
+        rec(now - 4 * store.HOUR_MS, "m", "", "2"),
+        rec(now, "m", "", "3")
+    ])
+        .unwrap();
+    assert_eq(store.segments("${data}/metrics").len(), 3);
+    store.housekeep_now(s);
+    assert_eq(store.segments("${data}/metrics"), [store.segment_of(now)]);
+    assert_eq(store.stats(s).dropped_segments, 2);
+    store.stop(s);
+    fs.remove_all(data);
+}

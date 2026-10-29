@@ -104,7 +104,7 @@ corte de luz con la caché del disco sin vaciar.
 
 ## Hallazgos de dogfood
 
-En `../findings/closed/2026-10/rayobs-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: los cinco arreglados; la campaña está archivada.
+En `../findings/closed/2026-10/rayobs-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: los cinco arreglados, y el router vuelve a tener el brazo con guarda; la campaña está archivada.
 
 Lo que se encontró con 1.27.85:
 

@@ -104,12 +104,8 @@ pub fn handle(ctx: Ctx, req: webserver.Request) -> webserver.Response {
         ("GET", "/v1/logs") => logs(ctx, q, now),
         ("GET", "/v1/query") => query(ctx, q, now),
         ("GET", "/v1/stats") => stats(ctx),
-        // Not a guarded arm: one breaks the native build here (finding).
-        _ => if (req.method == "GET" && req.path.starts_with("/v1/traces/")) {
-            trace(ctx, req.path.substring(11, req.path.len()), q, now)
-        } else {
-            error(404, "no such endpoint")
-        },
+        ("GET", path) if path.starts_with("/v1/traces/") => trace(ctx, path.substring(11, path.len()), q, now),
+        _ => error(404, "no such endpoint"),
     }
 }
 

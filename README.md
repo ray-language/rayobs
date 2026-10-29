@@ -104,7 +104,9 @@ corte de luz con la caché del disco sin vaciar.
 
 ## Hallazgos de dogfood
 
-En `../findings/open/rayobs-1.27.85.md`:
+En `../findings/closed/2026-10/rayobs-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: los cinco arreglados; la campaña está archivada.
+
+Lo que se encontró con 1.27.85:
 
 - **#291 [B] nativo**: un brazo de `match` con guarda, en una función que devuelve `webserver.Response`,
   no compila (E0382). Rodeo en `src/api.ray`: un `if` dentro del brazo `_`.

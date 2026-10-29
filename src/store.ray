@@ -135,7 +135,10 @@ const MAX_BATCH: int = 20000;
 const HOUSEKEEP_MS: int = 30000;
 
 fn writer(w: W, inbox: Channel<Msg>, window_ms: int) {
-    var housekeep_at = 0;
+    // Housekeep once before taking any message, so a restart applies retention without racing
+    // the first commit's reply; then every HOUSEKEEP_MS.
+    housekeep(w, time.now());
+    var housekeep_at = time.now() + HOUSEKEEP_MS;
     while (true) {
         // Wait for the first record of a window (or a tick for housekeeping).
         var pending: [Pending] = [];

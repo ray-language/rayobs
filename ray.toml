@@ -5,4 +5,4 @@ license = "Apache-2.0"
 raylang = "1.27.86"
 
 [dependencies]
-net = "^0.13.0"
+net = "^0.14.0"
